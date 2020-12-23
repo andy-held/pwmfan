@@ -31,6 +31,7 @@ struct PWM_Pin
         if constexpr (is_hw_pwm_pin(pin))
         {
             std::cout << "creating hardware pwm on pin " << pin << "\n";
+            wiringPiSetupGpio();
             pinMode(pin, PWM_OUTPUT);
             pwmSetClock(768); // Set PWM divider of base clock 19.2Mhz to 25Khz (Intel's recommendation for PWM FANs)
             pwmSetRange(pwm_range);
@@ -39,6 +40,7 @@ struct PWM_Pin
         else
         {
             std::cout << "creating software pwm on pin " << pin << "\n";
+            wiringPiSetupGpio();
             if (softPwmCreate(pin, pwm_range, pwm_range))
                 throw std::runtime_error("could not create soft pwm on pin" + std::to_string(pin));
         }
@@ -75,6 +77,7 @@ struct Tacho_Pin
     explicit Tacho_Pin(int pin_id):
         id(pin_id)
     {
+        wiringPiSetupGpio();
         pinMode(id, INPUT);
         pullUpDnControl(tacho_pin, PUD_UP);
         wiringPiISR(id, INT_EDGE_FALLING, []()
@@ -130,7 +133,6 @@ int calc_pwm_duty_from_temperature(float temp)
 
 int main()
 {
-    wiringPiSetupGpio();
     CPU_Temperature_Sensor temp_sens;
     PWM_Pin<pwm_pin_number> pwm_pin;
     Tacho_Pin tacho(16);
