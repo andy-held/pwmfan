@@ -15,8 +15,7 @@
 #include <docopt.h>
 #include <fmt/core.h>
 #include <fmt/ostream.h>
-#include <wiringPi.h>
-#include <softPwm.h>
+#include <pigpio.h>
 
 static const char USAGE[] =
 R"(pwmfan
@@ -51,7 +50,7 @@ struct Temperature_Average
     {
         std::fill_n(begin(values), size, initial_value);
     }
-    
+
     std::array<float, size> values;
     unsigned int index = 0;
 
@@ -62,6 +61,20 @@ struct Temperature_Average
         return std::accumulate(values.begin(), values.end(), 0.f) / size;
     }
 };
+
+struct PIGPIOHandler
+{
+    PIGPIOHandler()
+    {
+        if(gpioInitialise() < 0)
+            throw std::runtime_error("failed to initialize pigpio");
+    }
+
+    ~PIGPIOHandler()
+    {
+        gpioTerminate();
+    }
+}
 
 struct Pin
 {
@@ -190,12 +203,12 @@ int main(int argc, char** argv)
     };
     sigfillset(&sigHandler.sa_mask);
 
-    sigaction(SIGINT, &sigHandler, NULL);  
-    sigaction(SIGSEGV, &sigHandler, NULL);  
+    sigaction(SIGINT, &sigHandler, NULL);
+    sigaction(SIGSEGV, &sigHandler, NULL);
     sigaction(SIGILL, &sigHandler, NULL);
-    sigaction(SIGFPE, &sigHandler, NULL); 
-    sigaction(SIGABRT, &sigHandler, NULL); 
-    sigaction(SIGFPE, &sigHandler, NULL); 
+    sigaction(SIGFPE, &sigHandler, NULL);
+    sigaction(SIGABRT, &sigHandler, NULL);
+    sigaction(SIGFPE, &sigHandler, NULL);
     sigaction(SIGTERM, &sigHandler, NULL);
 
     auto calc_pwm_duty_from_temperature = [&]()
@@ -215,8 +228,7 @@ int main(int argc, char** argv)
         };
     }();
 
-    if (wiringPiSetupGpio())
-        throw std::runtime_error("setup failed");
+    PIGPIOHandler pigpio_handler;
     try
     {
         CPU_Temperature_Sensor temp_sens;
