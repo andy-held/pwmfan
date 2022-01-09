@@ -1,0 +1,9 @@
+[Unit]
+Description=PWM fan controller for the Raspberry Pi
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pwmfan
+
+[Install]
+WantedBy=basic.target
