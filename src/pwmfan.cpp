@@ -11,36 +11,45 @@
 #include <signal.h>
 #include <stdexcept>
 #include <thread>
+#include <experimental/source_location>
 
-#include <docopt.h>
 #include <fmt/core.h>
 #include <fmt/ostream.h>
 #include <pigpio.h>
 
-static const char USAGE[] =
-R"(pwmfan
+// adjust these:
+constexpr const unsigned int pwm_pin = 18;
+constexpr const unsigned int min_speed = 50;
+constexpr const unsigned int low_temp = 30;
+constexpr const unsigned int high_temp = 50;
+constexpr const unsigned int tacho_pin = 0;
 
-    Usage:
-      pwmfan [--pwm-pin=<pin>] [--min-speed=<%>] [--low-temp=<°C>] [--high-temp=<°C>] [--tacho-pin=<pin>]
-      pwmfan (-h | --help)
-
-    Options:
-      -h --help         Show this screen.
-      --pwm-pin=<pin>   BCM pin to use for PWM [default: 18].
-      --min-speed=<%>   Minimal fan speed [default: 50].
-      --low-temp=<°C>   If CPU temperatur is higher than this fan speed will increase [default: 30].
-      --high-temp=<°C>  If CPU temperature is at least this hight the fan will run at full speed [default: 50].
-      --tacho-pin=<pin> BCM pin to use for fan tachometer input. If it is not set, the tachometer will not be used.
-)";
 
 using namespace std::chrono_literals;
 constexpr const auto check_timeout = 2s;
 constexpr const unsigned int temp_average_interval = 5;
-constexpr const int pwm_range = 100;
+constexpr const unsigned int pwm_range = 100;
 
-constexpr bool is_hw_pwm_pin(int pin)
+constexpr bool is_hw_pwm_pin(unsigned int pin)
 {
     return pin == 12 or pin == 13 or pin == 18 or pin == 19;
+    //return false;
+}
+
+int gpio_throw_on_error(int error_code, const std::experimental::source_location location = std::experimental::source_location::current())
+{
+    if (error_code < 0)
+    {
+        std::runtime_error(
+          fmt::format(
+            "GPIO error with code {} at \nfile: {}({}:{}) `{}`: \n",
+            error_code,
+            location.file_name(),
+            location.line(),
+            location.column(),
+            location.function_name()));
+    }
+    return error_code;
 }
 
 template<unsigned int size>
@@ -66,94 +75,86 @@ struct PIGPIOHandler
 {
     PIGPIOHandler()
     {
-        if(gpioInitialise() < 0)
-            throw std::runtime_error("failed to initialize pigpio");
+        // gpio_throw_on_error(
+        //   gpioCfgClock(10, 1, 0));
+        uint32_t cfg = gpioCfgGetInternals();
+        cfg |= PI_CFG_NOSIGHANDLER;
+        cfg |= 1;
+        gpioCfgSetInternals(cfg);
+        gpio_throw_on_error(
+          gpioInitialise());
+        errno = 0; // pigpio checks its lock file, which will not exist and does not clean errno
     }
 
     ~PIGPIOHandler()
     {
         gpioTerminate();
     }
-}
+};
 
 struct Pin
 {
-    Pin(int id_in): id(id_in)
+    Pin(unsigned int id_in) : id(id_in)
     {}
 
     virtual ~Pin()
     {
-        pinMode(id, INPUT);
-        pullUpDnControl(id, PUD_OFF);
+        gpio_throw_on_error(
+          gpioSetMode(id, PI_INPUT));
+
+        gpio_throw_on_error(
+          gpioSetPullUpDown(id, PI_PUD_OFF));
     }
 
-    int id;
+    unsigned int id;
 };
 
-struct Output_Pin: public Pin
+struct PWM_Pin : public Pin
 {
-    Output_Pin(int id_in): Pin(id_in) {}
-    ~Output_Pin() override = default;
-
-    virtual void set(int value) = 0;
-};
-
-struct HW_PWM_Pin: public Output_Pin
-{
-    HW_PWM_Pin(int id_in): Output_Pin(id_in)
+    PWM_Pin() : Pin(pwm_pin)
     {
-        pinMode(id, PWM_OUTPUT);
-        pwmSetClock(768);// Set PWM divider of base clock 19.2Mhz to 25Khz (Intel's recommendation for PWM FANs)
-        pwmSetRange(pwm_range);
-        set(pwm_range);// Setting to the max PWM
+        if constexpr (!is_hw_pwm_pin(pwm_pin))
+        {
+            gpio_throw_on_error(
+              gpioSetPWMfrequency(id, 25000));
+            gpio_throw_on_error(
+              gpioSetPWMrange(id, pwm_range));
+        }
+        set(100);
     }
 
-    ~HW_PWM_Pin() override = default;
+    ~PWM_Pin() override = default;
 
-    void set(int value) override
+    void set(unsigned int value)
     {
-        pwmWrite(id, value);
-    }
-};
-
-struct SW_PWM_Pin: public Output_Pin
-{
-    SW_PWM_Pin(int id_in): Output_Pin(id_in)
-    {
-        if (softPwmCreate(id, pwm_range, pwm_range))
-            throw std::runtime_error(fmt::format("could not create soft pwm on pin {}", std::to_string(id)));
-    }
-
-    ~SW_PWM_Pin() override
-    {
-        softPwmStop(id);
-    }
-
-    void set(int value) override
-    {
-        softPwmWrite(id, value);
+        if constexpr (is_hw_pwm_pin(pwm_pin))
+        {
+            gpio_throw_on_error(
+              gpioHardwarePWM(id, static_cast<unsigned int>(25000), value*10000));
+        }
+        else
+        {
+            gpio_throw_on_error(
+                gpioPWM(id, value));
+        }
     }
 };
-
-std::unique_ptr<Output_Pin> create_pwm_pin(int id)
-{
-    if(id == 12 or id == 13 or id == 18 or id == 19)
-        return std::make_unique<HW_PWM_Pin>(id);
-    return std::make_unique<SW_PWM_Pin>(id);
-}
 
 std::atomic<int> rpm_pulses = 0;
-void inc_pulses()
+void inc_pulses(int, int, uint32_t)
 {
     rpm_pulses++;
 }
-struct Tacho_Pin: public Pin
+struct Tacho_Pin : public Pin
 {
-    explicit Tacho_Pin(int id_in): Pin(id_in)
+    explicit Tacho_Pin(unsigned int id_in) : Pin(id_in)
     {
-        pinMode(id, INPUT);
-        pullUpDnControl(id, PUD_UP);
-        wiringPiISR(id, INT_EDGE_FALLING, inc_pulses);
+        gpio_throw_on_error(
+          gpioSetMode(id, PI_INPUT));
+        gpio_throw_on_error(
+          gpioSetPullUpDown(id, PI_PUD_OFF));
+        gpio_throw_on_error(
+          gpioSetISRFunc(id, FALLING_EDGE, 500, inc_pulses));
         last_measurement = std::chrono::steady_clock::now();
     }
 
@@ -188,16 +189,14 @@ struct CPU_Temperature_Sensor
 std::condition_variable cond;
 std::mutex m;
 bool running = true;
-int main(int argc, char** argv)
+int main()
 {
-    std::map<std::string, docopt::value> args = docopt::docopt(USAGE, { argv + 1, argv + argc });
-    for(auto const& arg : args) {
-        fmt::print("{} {}\n", arg.first, arg.second);
-    }
+
+    PIGPIOHandler pigpio_handler;
+
     struct sigaction sigHandler;
     memset(&sigHandler, 0, sizeof(sigHandler));
-    sigHandler.sa_handler = [](int /*signal*/)
-    {
+    sigHandler.sa_handler = [](int /*signal*/) {
         running = false;
         cond.notify_one();
     };
@@ -211,39 +210,32 @@ int main(int argc, char** argv)
     sigaction(SIGFPE, &sigHandler, NULL);
     sigaction(SIGTERM, &sigHandler, NULL);
 
-    auto calc_pwm_duty_from_temperature = [&]()
-    {
-        const int min_speed = args["--min-speed"].asLong();
-        const int low_temp = args["--low-temp"].asLong();
+    auto calc_pwm_duty_from_temperature = [&]() {
         const float low_temp_f = static_cast<float>(low_temp);
-        const int high_temp = args["--high-temp"].asLong();
         const int linear_range = pwm_range - min_speed;
         const float temp_diff_range_factor = static_cast<float>(linear_range / (high_temp - low_temp));
 
-        return [=](float temp)
-        {
+        return [=](float temp) {
             float diff = temp - low_temp_f;
-            int linear_part = static_cast<int>(diff * temp_diff_range_factor);
-            return std::min(std::max(linear_part, 0) + min_speed, pwm_range);
+            auto linear_part = static_cast<unsigned int>(diff * temp_diff_range_factor);
+            return std::min(std::max(linear_part, static_cast<unsigned int>(0)) + min_speed, pwm_range);
         };
     }();
-
-    PIGPIOHandler pigpio_handler;
     try
     {
         CPU_Temperature_Sensor temp_sens;
-        std::unique_ptr<Output_Pin> pwm_pin = create_pwm_pin(args["--pwm-pin"].asLong());
+        auto pwm_pin_obj = PWM_Pin();
         std::unique_ptr<Tacho_Pin> tacho;
-        if(args["--tacho-pin"])
-            tacho = std::make_unique<Tacho_Pin>(args["--tacho-pin"].asLong());
+        if(tacho_pin > 0)
+            tacho = std::make_unique<Tacho_Pin>(tacho_pin);
         Temperature_Average<temp_average_interval> average(temp_sens());
         while (running)
         {
             auto average_temp = average.new_value(temp_sens());
             auto pwm_duty = calc_pwm_duty_from_temperature(average_temp);
-            pwm_pin->set(pwm_duty);
+            pwm_pin_obj.set(pwm_duty);
             if (errno)
-                throw std::runtime_error(std::strerror(errno));
+                throw std::runtime_error(fmt::format("errno {}, {}\n", errno, std::strerror(errno)));
             fmt::print("Temp: {:.2f} | Set PWM: {:2d}", average_temp, pwm_duty);
             if(tacho)
             {
@@ -252,10 +244,10 @@ int main(int argc, char** argv)
             }
             fmt::print("\n");
             std::unique_lock<std::mutex> lk(m);
-            cond.wait_for(lk, check_timeout, []{return !running;});
+            cond.wait_for(lk, check_timeout, [] { return !running; });
         }
     }
-    catch(const std::exception& e)
+    catch (const std::exception &e)
     {
         std::cerr << e.what() << '\n';
     }
